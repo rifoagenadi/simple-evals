@@ -154,6 +154,16 @@ def calculate_score(
     return overall_score
 
 
+def calculate_length_adjusted_score(
+    score: float,
+    response_text: str,
+    *,
+    center: float,
+    penalty_per_500_chars: float,
+) -> float:
+    return score - penalty_per_500_chars * ((len(response_text) - center) / 500.0)
+
+
 def get_usage_dict(response_usage) -> dict[str, int | None]:
     if response_usage is None:
         return {
@@ -273,7 +283,30 @@ class HealthBenchEval(Eval):
         run_reference_completions: bool = False,
         n_threads: int = 120,
         subset_name: Literal["hard", "consensus"] | None = None,
+        input_path: str | None = None,
+        length_adjustment_center: float | None = None,
+        length_adjustment_penalty_per_500_chars: float | None = None,
     ):
+        length_adjustment_enabled = (
+            length_adjustment_center is not None
+            or length_adjustment_penalty_per_500_chars is not None
+        )
+        if length_adjustment_enabled:
+            if (
+                length_adjustment_center is None
+                or length_adjustment_penalty_per_500_chars is None
+            ):
+                raise ValueError(
+                    "length_adjustment_center and "
+                    "length_adjustment_penalty_per_500_chars must be set together"
+                )
+            if length_adjustment_center < 0:
+                raise ValueError("length_adjustment_center must be non-negative")
+            if length_adjustment_penalty_per_500_chars < 0:
+                raise ValueError(
+                    "length_adjustment_penalty_per_500_chars must be non-negative"
+                )
+
         if run_reference_completions:
             assert physician_completions_mode is not None, (
                 "physician_completions_mode must be provided if run_reference_completions is True"
@@ -284,14 +317,18 @@ class HealthBenchEval(Eval):
                 "physician_completions_mode must have reference completions if run_reference_completions is True"
             )
 
-        if subset_name == "hard":
-            input_path = INPUT_PATH_HARD
-        elif subset_name == "consensus":
-            input_path = INPUT_PATH_CONSENSUS
-        elif subset_name is None:
-            input_path = INPUT_PATH
+        if input_path is None:
+            if subset_name == "hard":
+                input_path = INPUT_PATH_HARD
+            elif subset_name == "consensus":
+                input_path = INPUT_PATH_CONSENSUS
+            elif subset_name is None:
+                input_path = INPUT_PATH
+            else:
+                assert False, f"Invalid subset name: {subset_name}"
         else:
-            assert False, f"Invalid subset name: {subset_name}"
+            assert subset_name is None, "subset_name must be None when input_path is set"
+
         with bf.BlobFile(input_path, "rb") as f:
             examples = [json.loads(line) for line in f]
         for example in examples:
@@ -352,6 +389,10 @@ class HealthBenchEval(Eval):
         self.examples = examples * n_repeats
         self.n_threads = n_threads
         self.grader_model = grader_model
+        self.length_adjustment_center = length_adjustment_center
+        self.length_adjustment_penalty_per_500_chars = (
+            length_adjustment_penalty_per_500_chars
+        )
 
     def grade_sample(
         self,
@@ -394,6 +435,14 @@ class HealthBenchEval(Eval):
         metrics = {
             "overall_score": overall_score,
         }
+        if self.length_adjustment_center is not None:
+            assert self.length_adjustment_penalty_per_500_chars is not None
+            metrics["overall_score_length_adjusted"] = calculate_length_adjusted_score(
+                overall_score,
+                response_text,
+                center=self.length_adjustment_center,
+                penalty_per_500_chars=self.length_adjustment_penalty_per_500_chars,
+            )
 
         # compute scores for example-level tags)
         example_tag_scores = {tag: overall_score for tag in example_tags}

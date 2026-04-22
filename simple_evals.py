@@ -59,8 +59,87 @@ def main():
     parser.add_argument(
         "--examples", type=int, help="Number of examples to use (overrides default)"
     )
+    parser.add_argument(
+        "--healthbench-input-path",
+        type=str,
+        default=None,
+        help=(
+            "Run the main HealthBench eval from a blobfile-readable JSONL path in "
+            "HealthBench format. This only applies to --eval=healthbench."
+        ),
+    )
+    parser.add_argument(
+        "--healthbench-professional-mode",
+        action="store_true",
+        help=(
+            "Require the HealthBench Professional option bundle: main HealthBench "
+            "custom input path, GPT-5.4 low grader, and length adjustment."
+        ),
+    )
+    parser.add_argument(
+        "--healthbench-use-gpt-5-4-low-grader",
+        action="store_true",
+        help="Use GPT-5.4 with low reasoning effort as the HealthBench rubric grader.",
+    )
+    parser.add_argument(
+        "--healthbench-length-adjustment-center",
+        type=float,
+        default=None,
+        help=(
+            "Center character count for HealthBench length adjustment. Must be set "
+            "together with --healthbench-length-adjustment-penalty-per-500-chars."
+        ),
+    )
+    parser.add_argument(
+        "--healthbench-length-adjustment-penalty-per-500-chars",
+        type=float,
+        default=None,
+        help=(
+            "Numerical score penalty per 500 response characters for HealthBench "
+            "length adjustment. Must be set together with "
+            "--healthbench-length-adjustment-center."
+        ),
+    )
 
     args = parser.parse_args()
+    if (
+        args.healthbench_input_path is not None
+        and args.eval is not None
+        and "healthbench" not in args.eval.split(",")
+    ):
+        parser.error(
+            "--healthbench-input-path only applies when --eval includes healthbench"
+        )
+    if (
+        args.healthbench_length_adjustment_center is None
+    ) != (args.healthbench_length_adjustment_penalty_per_500_chars is None):
+        parser.error(
+            "--healthbench-length-adjustment-center and "
+            "--healthbench-length-adjustment-penalty-per-500-chars must be set together"
+        )
+    if args.healthbench_professional_mode:
+        evals_requested = set(args.eval.split(",")) if args.eval is not None else set()
+        if evals_requested != {"healthbench"}:
+            parser.error(
+                "--healthbench-professional-mode requires --eval=healthbench"
+            )
+        if args.healthbench_input_path is None:
+            parser.error(
+                "--healthbench-professional-mode requires --healthbench-input-path"
+            )
+        if not args.healthbench_use_gpt_5_4_low_grader:
+            parser.error(
+                "--healthbench-professional-mode requires "
+                "--healthbench-use-gpt-5-4-low-grader"
+            )
+        if (
+            args.healthbench_length_adjustment_center is None
+            or args.healthbench_length_adjustment_penalty_per_500_chars is None
+        ):
+            parser.error(
+                "--healthbench-professional-mode requires both HealthBench length "
+                "adjustment flags"
+            )
 
     models = {
         # Reasoning Models
@@ -256,6 +335,15 @@ def main():
         system_message=OPENAI_SYSTEM_MESSAGE_API,
         max_tokens=2048,
     )
+    healthbench_grading_sampler = (
+        ResponsesSampler(
+            model="gpt-5.4-2026-03-05",
+            reasoning_model=True,
+            reasoning_effort="low",
+        )
+        if args.healthbench_use_gpt_5_4_low_grader
+        else grading_sampler
+    )
     equality_checker = ChatCompletionSampler(model="gpt-4-turbo-preview")
     # ^^^ used for fuzzy matching, just for math
 
@@ -301,27 +389,40 @@ def main():
                 )
             case "healthbench":
                 return HealthBenchEval(
-                    grader_model=grading_sampler,
+                    grader_model=healthbench_grading_sampler,
                     num_examples=10 if debug_mode else num_examples,
                     n_repeats=args.n_repeats or 1,
                     n_threads=args.n_threads or 1,
                     subset_name=None,
+                    input_path=args.healthbench_input_path,
+                    length_adjustment_center=args.healthbench_length_adjustment_center,
+                    length_adjustment_penalty_per_500_chars=(
+                        args.healthbench_length_adjustment_penalty_per_500_chars
+                    ),
                 )
             case "healthbench_hard":
                 return HealthBenchEval(
-                    grader_model=grading_sampler,
+                    grader_model=healthbench_grading_sampler,
                     num_examples=10 if debug_mode else num_examples,
                     n_repeats=args.n_repeats or 1,
                     n_threads=args.n_threads or 1,
                     subset_name="hard",
+                    length_adjustment_center=args.healthbench_length_adjustment_center,
+                    length_adjustment_penalty_per_500_chars=(
+                        args.healthbench_length_adjustment_penalty_per_500_chars
+                    ),
                 )
             case "healthbench_consensus":
                 return HealthBenchEval(
-                    grader_model=grading_sampler,
+                    grader_model=healthbench_grading_sampler,
                     num_examples=10 if debug_mode else num_examples,
                     n_repeats=args.n_repeats or 1,
                     n_threads=args.n_threads or 1,
                     subset_name="consensus",
+                    length_adjustment_center=args.healthbench_length_adjustment_center,
+                    length_adjustment_penalty_per_500_chars=(
+                        args.healthbench_length_adjustment_penalty_per_500_chars
+                    ),
                 )
             case "healthbench_meta":
                 return HealthBenchMetaEval(
