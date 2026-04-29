@@ -42,6 +42,8 @@ DEFAULT_SEARCH_ENGINE = "duckduckgo"
 SEARCH_ENGINE_CHOICES = ("duckduckgo", "serper", "auto")
 ACTIVE_SEARCH_ENGINE = os.environ.get("BROWSECOMP_SEARCH_ENGINE", DEFAULT_SEARCH_ENGINE).lower()
 MAX_SEARCH_QUERY_CHARS = 512
+CONTEXT_BUDGET_SAFETY_MARGIN = 32
+MIN_CONTEXT_RETRY_MAX_TOKENS = 16
 
 QUERY_TEMPLATE = """
 {Question}
@@ -132,6 +134,7 @@ class SampleResult:
     extracted_final_answer: str
     grader_response: str
     raw_trajectory_path: str
+    error: str | None = None
 
 
 class ChatCompletionsSampler:
@@ -185,6 +188,7 @@ class ChatCompletionsSampler:
         message_list = self.prepare_messages(message_list)
 
         trial = 0
+        request_max_tokens = self.max_tokens
         while True:
             started_at = utc_now()
             try:
@@ -192,7 +196,7 @@ class ChatCompletionsSampler:
                     "model": self.model,
                     "messages": message_list,
                     "temperature": self.temperature,
-                    "max_tokens": self.max_tokens,
+                    "max_tokens": request_max_tokens,
                 }
                 if tools:
                     request_kwargs["tools"] = tools
@@ -210,7 +214,8 @@ class ChatCompletionsSampler:
                         "model": self.model,
                         "messages": message_list,
                         "temperature": self.temperature,
-                        "max_tokens": self.max_tokens,
+                        "max_tokens": request_max_tokens,
+                        "configured_max_tokens": self.max_tokens,
                         "base_url": self.base_url,
                         "system_message": self.system_message,
                         "tools": tools,
@@ -221,7 +226,21 @@ class ChatCompletionsSampler:
                     "started_at": started_at,
                     "completed_at": utc_now(),
                 }
-            except Exception:
+            except Exception as error:
+                reduced_max_tokens = reduced_max_tokens_for_context_error(error, request_max_tokens)
+                if reduced_max_tokens is not None:
+                    print(
+                        (
+                            "[context-budget] Reducing max_tokens "
+                            f"from {request_max_tokens} to {reduced_max_tokens} for {self.model}"
+                        ),
+                        flush=True,
+                    )
+                    request_max_tokens = reduced_max_tokens
+                    trial = 0
+                    continue
+                if is_context_budget_error(error):
+                    raise
                 if trial >= 5:
                     raise
                 time.sleep(2**trial)
@@ -285,6 +304,107 @@ def parse_tool_arguments(tool_call: dict[str, Any]) -> dict[str, Any]:
         return json.loads(raw_args)
     except json.JSONDecodeError:
         return {"_raw": raw_args}
+
+
+def safe_json_value(value: Any) -> Any:
+    if value is None or isinstance(value, str | int | float | bool):
+        return value
+    if isinstance(value, dict):
+        return {str(k): safe_json_value(v) for k, v in value.items()}
+    if isinstance(value, list | tuple):
+        return [safe_json_value(item) for item in value]
+    return str(value)
+
+
+def make_exception_payload(error: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": str(error),
+    }
+
+    for attr in ("status_code", "code", "param", "request_id"):
+        value = getattr(error, attr, None)
+        if value is not None:
+            payload[attr] = safe_json_value(value)
+
+    body = getattr(error, "body", None)
+    if body is not None:
+        payload["body"] = safe_json_value(body)
+
+    response = getattr(error, "response", None)
+    if response is not None:
+        status_code = getattr(response, "status_code", None)
+        if status_code is not None:
+            payload["status_code"] = status_code
+        url = getattr(response, "url", None)
+        if url:
+            payload["url"] = str(url)
+        response_text = getattr(response, "text", "")
+        if isinstance(response_text, str) and response_text.strip():
+            payload["response_text"] = response_text.strip()[:1000]
+
+    return payload
+
+
+def get_error_text(error: Exception) -> str:
+    payload = make_exception_payload(error)
+    parts = [str(error)]
+    body = payload.get("body")
+    if body is not None:
+        parts.append(json.dumps(body, ensure_ascii=False))
+    response_text = payload.get("response_text")
+    if response_text:
+        parts.append(str(response_text))
+    return "\n".join(parts)
+
+
+def reduced_max_tokens_for_context_error(
+    error: Exception,
+    requested_max_tokens: int,
+    *,
+    safety_margin: int = CONTEXT_BUDGET_SAFETY_MARGIN,
+) -> int | None:
+    text = get_error_text(error)
+    patterns = (
+        r"maximum context length is\s+(\d+)\s+tokens.*?request has\s+(\d+)\s+input tokens",
+        r"model'?s maximum context length is\s+(\d+)\s+tokens.*?request has\s+(\d+)\s+input tokens",
+    )
+
+    max_context: int | None = None
+    input_tokens: int | None = None
+    for pattern in patterns:
+        match = re.search(pattern, text, re.IGNORECASE | re.DOTALL)
+        if match:
+            max_context = int(match.group(1))
+            input_tokens = int(match.group(2))
+            break
+
+    if max_context is None or input_tokens is None:
+        match = re.search(r"\d+\s*>\s*(\d+)\s*-\s*(\d+)", text)
+        if match:
+            max_context = int(match.group(1))
+            input_tokens = int(match.group(2))
+
+    if max_context is None or input_tokens is None:
+        return None
+
+    available = max_context - input_tokens
+    if available < MIN_CONTEXT_RETRY_MAX_TOKENS:
+        return None
+
+    reduced = max(MIN_CONTEXT_RETRY_MAX_TOKENS, available - safety_margin)
+    if reduced >= requested_max_tokens:
+        return None
+    return reduced
+
+
+def is_context_budget_error(error: Exception) -> bool:
+    text = get_error_text(error).lower()
+    return (
+        "maximum context length" in text
+        and "input tokens" in text
+        and ("max_tokens" in text or "max_completion_tokens" in text)
+    )
 
 
 class PageTextExtractor(HTMLParser):
@@ -817,6 +937,69 @@ def evaluate_sample(
     )
 
 
+def make_failed_sample_result(
+    *,
+    idx: int,
+    row: dict[str, str],
+    raw_dir: str,
+    error: Exception,
+) -> SampleResult:
+    error_payload = make_exception_payload(error)
+    try:
+        question = decrypt(row["problem"], row["canary"])
+        correct_answer = decrypt(row["answer"], row["canary"])
+        task_id = make_task_id(question, idx)
+        prompt = QUERY_TEMPLATE.format(Question=question)
+    except Exception as decrypt_error:
+        question = ""
+        correct_answer = ""
+        task_id = f"browsecomp_{idx:04d}_failed"
+        prompt = ""
+        error_payload["decrypt_error"] = make_exception_payload(decrypt_error)
+
+    model_response = (
+        "Explanation: The sample failed due to a harness or model API error.\n"
+        "Exact Answer: None\n"
+        "Confidence: 0%"
+    )
+    grader_response = "Grading skipped because sample execution failed."
+    raw_trajectory_path = write_raw_trajectory(
+        raw_dir,
+        task_id,
+        {
+            "eval_name": "browsecomp",
+            "task_id": task_id,
+            "index": idx,
+            "created_at": utc_now(),
+            "score": False,
+            "question": question,
+            "correct_answer": correct_answer,
+            "prompt": prompt,
+            "error": error_payload,
+            "target": {
+                "text": model_response,
+                "error": error_payload,
+            },
+            "grader": {
+                "skipped": True,
+                "text": grader_response,
+            },
+        },
+    )
+    return SampleResult(
+        index=idx,
+        task_id=task_id,
+        score=False,
+        question=question,
+        correct_answer=correct_answer,
+        model_response=model_response,
+        extracted_final_answer="None",
+        grader_response=grader_response,
+        raw_trajectory_path=raw_trajectory_path,
+        error=error_payload["message"],
+    )
+
+
 def run_eval(
     *,
     target_sampler: ChatCompletionsSampler,
@@ -832,15 +1015,19 @@ def run_eval(
 
     if n_concurrent <= 1:
         for idx, row in enumerate(rows, start=1):
-            result = evaluate_sample(
-                idx=idx,
-                row=row,
-                target_sampler=target_sampler.clone(),
-                grader_sampler=grader_sampler.clone(),
-                raw_dir=raw_dir,
-                enable_search_tools=enable_search_tools,
-                max_tool_rounds=max_tool_rounds,
-            )
+            try:
+                result = evaluate_sample(
+                    idx=idx,
+                    row=row,
+                    target_sampler=target_sampler.clone(),
+                    grader_sampler=grader_sampler.clone(),
+                    raw_dir=raw_dir,
+                    enable_search_tools=enable_search_tools,
+                    max_tool_rounds=max_tool_rounds,
+                )
+            except Exception as error:
+                result = make_failed_sample_result(idx=idx, row=row, raw_dir=raw_dir, error=error)
+                print(f"[{idx}/{len(rows)}] sample failed: {type(error).__name__}: {error}", flush=True)
             results.append(result)
             running_accuracy = sum(item.score for item in results) / len(results)
             print(f"[{len(results)}/{len(rows)}] accuracy={running_accuracy:.3f}")
@@ -860,7 +1047,17 @@ def run_eval(
                 for idx, row in enumerate(rows, start=1)
             }
             for future in as_completed(future_to_idx):
-                result = future.result()
+                idx = future_to_idx[future]
+                try:
+                    result = future.result()
+                except Exception as error:
+                    result = make_failed_sample_result(
+                        idx=idx,
+                        row=rows[idx - 1],
+                        raw_dir=raw_dir,
+                        error=error,
+                    )
+                    print(f"[{idx}/{len(rows)}] sample failed: {type(error).__name__}: {error}", flush=True)
                 results.append(result)
                 running_accuracy = sum(item.score for item in results) / len(results)
                 print(f"[{len(results)}/{len(rows)}] accuracy={running_accuracy:.3f}")
@@ -903,6 +1100,7 @@ def write_outputs(
                 "grader_model": grader_model,
                 "accuracy": accuracy,
                 "num_examples": len(results),
+                "failed_examples": sum(1 for result in results if result.error),
                 "raw_trajectory_dir": raw_dir,
                 "search_tools_enabled": enable_search_tools,
                 "search_engine": search_engine,
@@ -932,6 +1130,7 @@ def write_outputs(
                         "extracted_final_answer": result.extracted_final_answer,
                         "grader_response": result.grader_response,
                         "raw_trajectory_path": result.raw_trajectory_path,
+                        "error": result.error,
                     }
                     for result in results
                 ],
@@ -957,6 +1156,7 @@ def write_outputs(
                 "n_concurrent": n_concurrent,
                 "requested_examples": num_examples_requested,
                 "completed_examples": len(results),
+                "failed_examples": sum(1 for result in results if result.error),
                 "accuracy": accuracy,
                 "run_started_at": run_started_at,
                 "run_completed_at": run_completed_at,
