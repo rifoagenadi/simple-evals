@@ -13,8 +13,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from html.parser import HTMLParser
 from typing import Any
-from urllib.parse import urljoin
-
+from urllib.parse import parse_qs, unquote, urlparse
 import requests
 from openai import OpenAI
 
@@ -25,9 +24,9 @@ BROWSECOMP_DATASET_URL = (
 DEFAULT_TARGET_SYSTEM_MESSAGE = """
 You are a web research assistant solving BrowseComp questions.
 
-You MUST use the provided web search tools before giving a final answer.
+Use the provided web search tools to gather evidence when they help answer the question.
 Do not rely only on internal memory or produce long unsupported reasoning.
-Search the web, open promising pages, gather evidence, then answer only when you have enough support.
+Search the web, open promising pages, gather evidence, then answer when you have enough support.
 
 When you are ready to answer, use exactly this format:
 Explanation: <brief evidence-backed explanation>
@@ -39,7 +38,10 @@ DEFAULT_GRADER_MODEL = "gpt-4.1-2025-04-14"
 DEFAULT_MAX_TOOL_ROUNDS = 12
 DEFAULT_SEARCH_RESULTS = 5
 DEFAULT_FETCH_CHAR_LIMIT = 12000
-DEFAULT_FINALIZATION_RETRIES = 2
+DEFAULT_SEARCH_ENGINE = "duckduckgo"
+SEARCH_ENGINE_CHOICES = ("duckduckgo", "serper", "auto")
+ACTIVE_SEARCH_ENGINE = os.environ.get("BROWSECOMP_SEARCH_ENGINE", DEFAULT_SEARCH_ENGINE).lower()
+MAX_SEARCH_QUERY_CHARS = 512
 
 QUERY_TEMPLATE = """
 {Question}
@@ -48,29 +50,6 @@ Your response should be in the following format:
 Explanation: {{your explanation for your final answer}}
 Exact Answer: {{your succinct, final answer}}
 Confidence: {{your confidence score between 0% and 100% for your answer}}
-""".strip()
-
-FINALIZATION_PROMPT = """
-Stop browsing now. Based only on the evidence gathered so far, provide your final answer.
-
-You MUST respond in exactly this format:
-Explanation: <brief evidence-backed explanation>
-Exact Answer: <succinct final answer>
-Confidence: <0% to 100%>
-
-Do not call any tools. Do not continue searching. Do not refuse to answer.
-""".strip()
-
-FIRST_TOOL_CALL_PROMPT = """
-You have not used any tools yet.
-Before giving a final answer, you must make at least one tool call.
-Call `search_web` or `open_url` now. Do not provide a final answer in this turn.
-""".strip()
-
-NO_TOOL_CALL_FAILURE_RESPONSE = """
-Explanation: The harness did not accept a final answer because the model never used a required browsing tool.
-Exact Answer: None
-Confidence: 0%
 """.strip()
 
 GRADER_TEMPLATE = """
@@ -337,61 +316,177 @@ class PageTextExtractor(HTMLParser):
         return text.strip()
 
 
-class DuckDuckGoResultsParser(HTMLParser):
+class DuckDuckGoResultParser(HTMLParser):
     def __init__(self, max_results: int):
         super().__init__()
         self.max_results = max_results
         self.results: list[dict[str, str]] = []
-        self._capture_link = False
-        self._current_href = ""
-        self._current_text: list[str] = []
+        self._capture: str | None = None
+        self._capture_tag: str | None = None
+        self._parts: list[str] = []
+        self._pending_url = ""
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        if len(self.results) >= self.max_results or tag != "a":
-            return
-        attr_map = dict(attrs)
-        class_name = attr_map.get("class") or ""
-        href = attr_map.get("href") or ""
-        if "result__a" in class_name and href:
-            self._capture_link = True
-            self._current_href = href
-            self._current_text = []
+        attrs_dict = {name: value or "" for name, value in attrs}
+        class_names = attrs_dict.get("class", "")
 
-    def handle_endtag(self, tag: str) -> None:
-        if tag == "a" and self._capture_link:
-            title = " ".join(self._current_text).strip()
-            url = self._current_href
-            if url.startswith("/"):
-                url = urljoin("https://duckduckgo.com", url)
-            if "uddg=" in url:
-                match = re.search(r"[?&]uddg=([^&]+)", url)
-                if match:
-                    url = requests.utils.unquote(match.group(1))
-            self.results.append({"title": title or url, "url": url})
-            self._capture_link = False
-            self._current_href = ""
-            self._current_text = []
+        if tag == "a" and ("result__a" in class_names or "result-link" in class_names):
+            self._capture = "title"
+            self._capture_tag = tag
+            self._parts = []
+            self._pending_url = normalize_duckduckgo_url(attrs_dict.get("href", ""))
+            return
+
+        if self.results and ("result__snippet" in class_names or "result-snippet" in class_names):
+            self._capture = "snippet"
+            self._capture_tag = tag
+            self._parts = []
 
     def handle_data(self, data: str) -> None:
-        if self._capture_link:
-            self._current_text.append(data.strip())
+        if self._capture:
+            self._parts.append(data)
+
+    def handle_endtag(self, tag: str) -> None:
+        if not self._capture or tag != self._capture_tag:
+            return
+
+        text = clean_search_text(" ".join(self._parts))
+        if self._capture == "title" and text and self._pending_url:
+            if not any(result["url"] == self._pending_url for result in self.results):
+                self.results.append({"title": text, "url": self._pending_url, "snippet": ""})
+        elif self._capture == "snippet" and text and self.results:
+            self.results[-1]["snippet"] = text
+
+        self._capture = None
+        self._capture_tag = None
+        self._parts = []
+        self._pending_url = ""
 
 
 def search_web(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> dict[str, Any]:
     max_results = max(1, min(max_results, 10))
-    response = requests.get(
+    search_engine = ACTIVE_SEARCH_ENGINE
+    if search_engine == "auto":
+        if os.environ.get("SERPER_API_KEY"):
+            try:
+                return search_serper(query, max_results)
+            except requests.RequestException as error:
+                result = search_duckduckgo(query, max_results)
+                result["fallback_from"] = make_tool_error_payload(error)
+                return result
+        return search_duckduckgo(query, max_results)
+    if search_engine == "duckduckgo":
+        return search_duckduckgo(query, max_results)
+    if search_engine == "serper":
+        return search_serper(query, max_results)
+    return {
+        "engine": search_engine,
+        "query": query,
+        "results": [],
+        "error": f"Unknown search engine: {search_engine}",
+    }
+
+
+def clean_search_text(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def normalize_search_query(query: str) -> str:
+    return clean_search_text(str(query))[:MAX_SEARCH_QUERY_CHARS]
+
+
+def normalize_duckduckgo_url(url: str) -> str:
+    if url.startswith("//"):
+        url = f"https:{url}"
+    elif url.startswith("/"):
+        url = f"https://duckduckgo.com{url}"
+
+    parsed = urlparse(url)
+    if parsed.netloc.endswith("duckduckgo.com") and parsed.path.startswith("/l/"):
+        uddg = parse_qs(parsed.query).get("uddg")
+        if uddg:
+            return unquote(uddg[0])
+    return url
+
+
+def search_duckduckgo(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> dict[str, Any]:
+    query = normalize_search_query(query)
+    if not query:
+        return {"engine": "duckduckgo/html", "query": query, "results": [], "error": "empty query"}
+
+    endpoints = (
         "https://html.duckduckgo.com/html/",
-        params={"q": query},
-        headers={"User-Agent": "Mozilla/5.0"},
-        timeout=60,
+        "https://duckduckgo.com/html/",
+        "https://lite.duckduckgo.com/lite/",
     )
-    response.raise_for_status()
-    parser = DuckDuckGoResultsParser(max_results)
-    parser.feed(response.text)
+    errors: list[dict[str, Any]] = []
+
+    for endpoint in endpoints:
+        try:
+            response = requests.get(
+                endpoint,
+                params={"q": query},
+                headers={
+                    "User-Agent": "Mozilla/5.0",
+                    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                },
+                timeout=60,
+            )
+            response.raise_for_status()
+        except requests.RequestException as error:
+            errors.append(make_tool_error_payload(error))
+            continue
+
+        parser = DuckDuckGoResultParser(max_results=max_results)
+        parser.feed(response.text)
+        results = parser.results[:max_results]
+        if results:
+            return {
+                "engine": "duckduckgo/html",
+                "query": query,
+                "results": results,
+            }
+
+        errors.append({
+            "type": "NoResultsParsed",
+            "message": f"No DuckDuckGo results parsed from {endpoint}",
+            "retryable": False,
+            "url": response.url,
+            "status_code": response.status_code,
+        })
+
     return {
         "engine": "duckduckgo/html",
         "query": query,
-        "results": parser.results[:max_results],
+        "results": [],
+        "error": errors[-1] if errors else "No DuckDuckGo results",
+    }
+
+
+def search_serper(query: str, max_results: int = DEFAULT_SEARCH_RESULTS) -> dict[str, Any]:
+    query = normalize_search_query(query)
+    serper_api_key = os.environ.get("SERPER_API_KEY", "")
+    if not serper_api_key:
+        return {"engine": "serper", "query": query, "results": [], "error": "SERPER_API_KEY not set"}
+    response = requests.post(
+        "https://google.serper.dev/search",
+        headers={"X-API-KEY": serper_api_key, "Content-Type": "application/json"},
+        json={"q": query, "num": max_results},
+        timeout=60,
+    )
+    response.raise_for_status()
+    data = response.json()
+    results: list[dict[str, str]] = []
+    for item in data.get("organic", [])[:max_results]:
+        results.append({
+            "title": item.get("title", item.get("link", "")),
+            "url": item.get("link", ""),
+            "snippet": item.get("snippet", ""),
+        })
+    return {
+        "engine": "serper",
+        "query": query,
+        "results": results,
     }
 
 
@@ -418,23 +513,58 @@ def open_url(url: str, max_chars: int = DEFAULT_FETCH_CHAR_LIMIT) -> dict[str, A
     }
 
 
+def make_tool_error_payload(error: Exception) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "type": type(error).__name__,
+        "message": str(error),
+        "retryable": False,
+    }
+
+    if isinstance(error, requests.HTTPError):
+        response = error.response
+        if response is not None:
+            payload["status_code"] = response.status_code
+            payload["url"] = response.url
+            payload["retryable"] = response.status_code in {408, 409, 425, 429, 500, 502, 503, 504}
+            response_text = response.text.strip()
+            if response_text:
+                payload["response_text"] = response_text[:1000]
+    elif isinstance(error, requests.Timeout):
+        payload["retryable"] = True
+    elif isinstance(error, requests.RequestException):
+        request = getattr(error, "request", None)
+        if request is not None and getattr(request, "url", None):
+            payload["url"] = request.url
+        payload["retryable"] = True
+
+    return payload
+
+
+def make_tool_error_result(error: Exception) -> dict[str, Any]:
+    payload = make_tool_error_payload(error)
+    return {"error": payload}
+
+
 def execute_tool_call(tool_call: dict[str, Any]) -> dict[str, Any]:
     function = tool_call.get("function") or {}
     name = function.get("name", "")
     arguments = parse_tool_arguments(tool_call)
 
-    if name == "search_web":
-        result = search_web(
-            query=str(arguments.get("query", "")),
-            max_results=int(arguments.get("max_results", DEFAULT_SEARCH_RESULTS)),
-        )
-    elif name == "open_url":
-        result = open_url(
-            url=str(arguments.get("url", "")),
-            max_chars=int(arguments.get("max_chars", DEFAULT_FETCH_CHAR_LIMIT)),
-        )
-    else:
-        result = {"error": f"Unknown tool: {name}"}
+    try:
+        if name == "search_web":
+            result = search_web(
+                query=str(arguments.get("query", "")),
+                max_results=int(arguments.get("max_results", DEFAULT_SEARCH_RESULTS)),
+            )
+        elif name == "open_url":
+            result = open_url(
+                url=str(arguments.get("url", "")),
+                max_chars=int(arguments.get("max_chars", DEFAULT_FETCH_CHAR_LIMIT)),
+            )
+        else:
+            result = {"error": {"type": "UnknownTool", "message": f"Unknown tool: {name}", "retryable": False}}
+    except Exception as error:
+        result = make_tool_error_result(error)
 
     return {
         "tool_name": name,
@@ -525,14 +655,14 @@ def run_target_sample(
     steps: list[dict[str, Any]] = []
     terminated_due_to_max_tool_rounds = False
     used_search_tools = False
+    final_text = ""
     last_trace: dict[str, Any] | None = None
 
     for _ in range(max_tool_rounds + 1):
-        require_first_tool_call = enable_search_tools and not used_search_tools
         content, trace = target_sampler.complete(
             conversation,
             tools=SEARCH_TOOLS if enable_search_tools else None,
-            tool_choice="required" if require_first_tool_call else None,
+            tool_choice=None,
         )
         last_trace = trace
         assistant_message = trace["assistant_message"]
@@ -574,18 +704,6 @@ def run_target_sample(
             continue
 
         final_text = render_content(assistant_message.get("content")).strip() or content.strip()
-        if require_first_tool_call:
-            step_record["missing_required_tool_call"] = True
-            steps.append(step_record)
-            conversation.append({
-                "role": "assistant",
-                "content": assistant_message.get("content"),
-            })
-            harness_message = target_sampler.pack_message("user", FIRST_TOOL_CALL_PROMPT)
-            conversation.append(harness_message)
-            transcript.append(harness_message)
-            continue
-
         steps.append(step_record)
         conversation.append({
             "role": "assistant",
@@ -594,41 +712,6 @@ def run_target_sample(
         break
     else:
         terminated_due_to_max_tool_rounds = True
-
-    final_text = ""
-    for _ in range(DEFAULT_FINALIZATION_RETRIES):
-        if enable_search_tools and not used_search_tools:
-            final_text = NO_TOOL_CALL_FAILURE_RESPONSE
-            break
-        if extract_exact_answer(render_content(conversation[-1].get("content"))):
-            final_text = render_content(conversation[-1].get("content")).strip()
-            break
-
-        harness_message = target_sampler.pack_message("user", FINALIZATION_PROMPT)
-        conversation.append(harness_message)
-        transcript.append(harness_message)
-        content, trace = target_sampler.complete(conversation, tools=None, tool_choice=None)
-        last_trace = trace
-        assistant_message = trace["assistant_message"]
-        response_history.append(trace["response"])
-        transcript.append(assistant_message)
-        step_record = {
-            "assistant_message": assistant_message,
-            "response": trace["response"],
-            "started_at": trace["started_at"],
-            "completed_at": trace["completed_at"],
-            "tool_calls": [],
-            "observations": [],
-            "harness_finalization": True,
-        }
-        steps.append(step_record)
-        conversation.append({
-            "role": "assistant",
-            "content": assistant_message.get("content"),
-        })
-        final_text = render_content(assistant_message.get("content")).strip() or content.strip()
-        if extract_exact_answer(final_text):
-            break
 
     if not final_text and conversation and conversation[-1].get("role") == "assistant":
         final_text = render_content(conversation[-1].get("content")).strip()
@@ -799,6 +882,7 @@ def write_outputs(
     temperature: float,
     max_tokens: int,
     enable_search_tools: bool,
+    search_engine: str,
     max_tool_rounds: int,
     n_concurrent: int,
     run_started_at: str,
@@ -821,6 +905,7 @@ def write_outputs(
                 "num_examples": len(results),
                 "raw_trajectory_dir": raw_dir,
                 "search_tools_enabled": enable_search_tools,
+                "search_engine": search_engine,
                 "max_tool_rounds": max_tool_rounds,
                 "n_concurrent": n_concurrent,
                 "run_started_at": run_started_at,
@@ -867,6 +952,7 @@ def write_outputs(
                 "temperature": temperature,
                 "max_tokens": max_tokens,
                 "search_tools_enabled": enable_search_tools,
+                "search_engine": search_engine,
                 "max_tool_rounds": max_tool_rounds,
                 "n_concurrent": n_concurrent,
                 "requested_examples": num_examples_requested,
@@ -944,6 +1030,15 @@ def parse_args() -> argparse.Namespace:
         help="Disable the local search/open-url tools and query the model in a single shot.",
     )
     parser.add_argument(
+        "--search-engine",
+        choices=SEARCH_ENGINE_CHOICES,
+        default=os.environ.get("BROWSECOMP_SEARCH_ENGINE", DEFAULT_SEARCH_ENGINE).lower(),
+        help=(
+            "Search provider for search_web. Use duckduckgo to avoid Serper credits, "
+            "serper for the paid Serper API, or auto to try Serper then fall back to DuckDuckGo."
+        ),
+    )
+    parser.add_argument(
         "--max-tool-rounds",
         type=int,
         default=DEFAULT_MAX_TOOL_ROUNDS,
@@ -960,11 +1055,15 @@ def parse_args() -> argparse.Namespace:
         parser.error("Missing target API key. Pass --api-key or set TARGET_OPENAI_API_KEY.")
     if not args.grader_api_key:
         parser.error("Missing grader API key. Pass --grader-api-key or set OPENAI_API_KEY.")
+    if args.search_engine not in SEARCH_ENGINE_CHOICES:
+        parser.error(f"--search-engine must be one of: {', '.join(SEARCH_ENGINE_CHOICES)}")
     return args
 
 
 def main() -> None:
     args = parse_args()
+    global ACTIVE_SEARCH_ENGINE
+    ACTIVE_SEARCH_ENGINE = args.search_engine
     ensure_dir(args.output_dir)
     run_paths = build_run_paths(args.output_dir, args.model)
     ensure_dir(run_paths["raw_dir"])
@@ -1007,6 +1106,7 @@ def main() -> None:
         temperature=args.temperature,
         max_tokens=args.max_tokens,
         enable_search_tools=not args.disable_search_tools,
+        search_engine=args.search_engine,
         max_tool_rounds=args.max_tool_rounds,
         n_concurrent=args.n_concurrent,
         run_started_at=run_started_at,
