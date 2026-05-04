@@ -800,11 +800,14 @@ def run_target_sample(
         }
         if enable_search_tools and tool_calls:
             used_search_tools = True
-            conversation.append({
+            msg = {
                 "role": "assistant",
                 "content": assistant_message.get("content"),
-                "tool_calls": tool_calls,
-            })
+                "tool_calls": tool_calls
+            }
+            if assistant_message.get("reasoning_content"):
+                msg["reasoning_content"] = assistant_message.get("reasoning_content")
+            conversation.append(msg)
             for tool_call in tool_calls:
                 tool_result = execute_tool_call(tool_call)
                 tool_message = {
@@ -825,10 +828,13 @@ def run_target_sample(
 
         final_text = render_content(assistant_message.get("content")).strip() or content.strip()
         steps.append(step_record)
-        conversation.append({
+        msg = {
             "role": "assistant",
             "content": assistant_message.get("content"),
-        })
+        }
+        if assistant_message.get("reasoning_content"):
+            msg["reasoning_content"] = assistant_message.get("reasoning_content")
+        conversation.append(msg)
         break
     else:
         terminated_due_to_max_tool_rounds = True
